@@ -1,6 +1,14 @@
 import io
 import math
 import sys
+
+import numpy as np
+import matplotlib as mpl
+
+# matplotlib 默认字体没有中文字形, 不设置的话坐标轴标签会显示成方框
+mpl.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "SimSun",
+                                   "Noto Sans CJK SC", "DejaVu Sans"]
+mpl.rcParams["axes.unicode_minus"] = False
 from typing import Callable
 from latex_tran import latex_tran
 from flow_measure import flow_measure
@@ -112,11 +120,18 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.measure = flow_measure()
         self._profile_cache: dict[int, QPixmap] = {}
+        self._qref_cache: dict[int, float] = {}
+        self._curve_cache: dict[tuple, tuple] = {}
+        self.path_angle_deg = 0.0
+        self._curve_xlim = (0.0, 180.0)
+        self._curve_ylim = (-1.0, 1.0)
+        self._curve_angles = None
+        self._curve_eps = None
 
         main_layout = QVBoxLayout()
         
         self.map_profile = ImageLabel()
-        self.map_axis = QLabel("test")
+        self.map_axis = ImageLabel()
         for map_widget in (self.map_profile, self.map_axis):
             map_widget.setMinimumSize(200, 200)
             map_widget.setSizePolicy(
@@ -149,6 +164,8 @@ class MainWindow(QMainWindow):
         self.select_formula.currentIndexChanged.connect(self.change_formula)
 
         self.select_model = QComboBox()
+        self.select_model.addItems(list(self.measure.SCHEMES))
+        self.select_model.currentTextChanged.connect(lambda _: self.show_error_curve())
         select_layout = QHBoxLayout()
         select_layout.addWidget(self.select_formula)
         select_layout.addWidget(self.select_model)
@@ -156,11 +173,17 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(select_layout)
 
         self.dial = QDial()
+        self.dial.setRange(0, 180)
         self.dial.valueChanged.connect(self.rotate_paths)
         main_layout.addWidget(self.dial)
 
+        self.readout = QLabel("")
+        self.readout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        main_layout.addWidget(self.readout)
+
         self.path_angle_deg = 0.0
         self.map_profile.set_overlay(self.draw_acoustic_paths)
+        self.map_axis.set_overlay(self.draw_angle_marker)
 
         container = QWidget()
         container.setLayout(main_layout)
@@ -173,6 +196,7 @@ class MainWindow(QMainWindow):
         formula = rf"(1-r)^{{\frac{{1}}{{{n}}}}}+{coefficient}r(1-r)^{{\frac{{1}}{{{k}}}}}{f}"
         self.formula_ture.setPixmap(latex_tran(formula))
         self.show_profile(idx)
+        self.show_error_curve()
 
     def show_profile(self, idx: int):
         entry = self._profile_cache.get(idx)
@@ -205,6 +229,82 @@ class MainWindow(QMainWindow):
     def rotate_paths(self, value: int):
         self.path_angle_deg = value / self.dial.maximum() * DIAL_ANGLE_SPAN
         self.map_profile.update()
+        self.map_axis.update()
+        self.update_readout()
+
+
+    # ---------------- 误差-角度曲线 ----------------
+    def current_scheme(self) -> str:
+        combo = getattr(self, "select_model", None)
+        text = combo.currentText() if combo is not None else ""
+        return text if text in self.measure.SCHEMES else "Gauss-Jacobi"
+
+    def show_error_curve(self):
+        """按当前模型与积分方法渲染 ε(α) 曲线, 并显示到 self.map_axis。"""
+        idx = self.select_formula.currentIndex()
+        scheme = self.current_scheme()
+        key = (idx, scheme)
+        entry = self._curve_cache.get(key)
+        if entry is None:
+            entry = self._render_error_curve(idx, scheme)
+            self._curve_cache[key] = entry
+        pm, transform, xlim, ylim, angles, eps = entry
+        self._curve_xlim, self._curve_ylim = xlim, ylim
+        self._curve_angles, self._curve_eps = angles, eps
+        self.map_axis.set_image(pm, transform)
+        self.map_axis.update()
+        self.update_readout()
+
+    def _render_error_curve(self, idx: int, scheme: str):
+        profile = self.measure.model_list[idx]
+        q_ref = self._qref_cache.get(idx)
+        if q_ref is None:
+            q_ref = self.measure.reference_flow(profile, Nw=401, Nt=360)
+            self._qref_cache[idx] = q_ref
+        angles, eps = self.measure.error_curve(profile, scheme, q_ref=q_ref)
+
+        fig = Figure(figsize=(5.0, 4.6), dpi=200)
+        FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+        ax.plot(angles, eps, "-", lw=1.4, color="#2b6cb0")
+        ax.axhline(0.0, color="0.4", lw=0.8, ls="--")
+        ax.set_xlim(0.0, 180.0)
+        span = max(0.05, float(np.max(np.abs(eps))) * 1.2)
+        ax.set_ylim(-span, span)
+        ax.set_xticks(np.arange(0, 181, 30))
+        ax.set_xlabel("旋转角 α (°)")
+        ax.set_ylabel("测量误差 ε (%)")
+        ax.set_title("%s    Code: A%d" % (scheme, idx + 1), fontsize=10)
+        ax.grid(alpha=0.3)
+
+        fig.canvas.draw()                       # 先完成布局, transData 才是最终位置
+        transform = data_to_image(ax, fig)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png")          # 不能用 bbox_inches="tight"
+        pm = QPixmap()
+        if not pm.loadFromData(buf.getvalue(), "PNG"):
+            raise RuntimeError("Code: A%d 误差曲线渲染失败" % (idx + 1))
+        return pm, transform, (0.0, 180.0), (-span, span), angles, eps
+
+    def update_readout(self):
+        """当前角度与对应误差的读数(用 QLabel 显示)。"""
+        if not hasattr(self, "readout"):
+            return
+        text = "α = %.0f°" % self.path_angle_deg
+        if self._curve_eps is not None and self._curve_eps.size:
+            value = float(np.interp(self.path_angle_deg,
+                                    self._curve_angles, self._curve_eps))
+            text += "    ε = %+.3f%%" % value
+        text += "    (%s, Code: A%d)" % (self.current_scheme(),
+                                       self.select_formula.currentIndex() + 1)
+        self.readout.setText(text)
+
+    def draw_angle_marker(self, painter: QPainter, to_widget):
+        """在误差曲线图上叠加当前旋转角的竖线与读数(实时, 不重算曲线)。"""
+        x = self.path_angle_deg
+        y0, y1 = self._curve_ylim
+        painter.setPen(QPen(QColor(220, 38, 38), 1.8, Qt.PenStyle.DashLine))
+        painter.drawLine(to_widget(x, y0), to_widget(x, y1))
 
     def draw_acoustic_paths(self, painter: QPainter, to_widget):
         """在云图上叠加四条平行声线，方向由 dial 控制。"""

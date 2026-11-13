@@ -2,6 +2,16 @@ from numpy import cos, exp, pi, sin
 import numpy as np
 import matplotlib.pyplot as plt
 from types import SimpleNamespace
+from collections import namedtuple
+
+# numpy>=2.0 移除了 np.trapz, 统一用 trapezoid; 旧版本回退到 trapz
+_trapz = getattr(np, "trapezoid", None) or getattr(np, "trapz")
+
+# chord_flow() 的返回值: 具名元组, 可按名字或下标取值
+ChordResult = namedtuple(
+    "ChordResult",
+    "v_bar chord_length line_integral flow_per_dz flow omega_contrib max_v d theta_deg")
+
 
 class flow_measure():
     def __init__(self):
@@ -91,6 +101,107 @@ class flow_measure():
                              * exp(-0.3 * self.theta) * sin(5 * self.theta)**2,
 
         ]
+
+    # ---------------------------------------------------------------
+    # 四声道积分方案: (声道相对高度 d, 权系数 ω)
+    # ---------------------------------------------------------------
+    SCHEMES = {
+        "Gauss-Jacobi": [(0.309017, 0.597566), (0.809017, 0.369316)],
+        "OWCIS": [(0.303783, 0.588228), (0.799639, 0.371884)],
+    }
+
+    def chord_flow(self, profile, d, theta_deg, N=401, R=1.0, vc=1.0,
+                   dz=None, omega=None, degrees=True):
+        """沿一条声道计算该流型的速度与流量。
+
+        profile   : model_list 中的某个成员 (lambda self: ...)
+        d         : 声道到圆心的距离, 以半径为单位, 要求 |d| < 1
+        theta_deg : 声道方位角(度, 自 +x 轴逆时针); degrees=False 时按弧度传入
+        N         : 沿弦采样点数(余弦聚集, 401 点精度约 1e-5)
+        R, vc     : 物理半径[m] 与管心速度[m/s]; 默认 1,1 得到归一化结果
+        dz        : 若给定, 顺带算出该窄条的体积流量[m^3/s]
+        omega     : 若给定该声道权系数, 顺带算出它在总流量中的份额
+
+        返回 ChordResult(v_bar, chord_length, line_integral, flow_per_dz,
+                         flow, omega_contrib, max_v, d, theta_deg)
+        """
+        th = float(theta_deg) if not degrees else np.deg2rad(theta_deg)
+        d = float(d)
+        if not (-1.0 < d < 1.0):
+            raise ValueError("|d| 必须小于 1: 声道不能落在管壁上")
+
+        c_n = 2.0 * np.sqrt(1.0 - d * d)                      # 归一化弦长
+        nv = (-sin(th), cos(th))                              # 弦的法向
+        ev = (cos(th), sin(th))                               # 弦的切向
+        s_n = (c_n / 2.0) * np.cos(np.linspace(pi, 0.0, N))    # 端点加密的采样点
+
+        x_n = d * nv[0] + s_n * ev[0]
+        z_n = d * nv[1] + s_n * ev[1]
+        r = np.clip(np.hypot(x_n, z_n), 0.0, 1.0)
+        t = np.mod(np.arctan2(z_n, x_n), 2.0 * pi)            # 折到 [0, 2π)
+
+        v = np.asarray(profile(SimpleNamespace(r=r, theta=t, alpha=t)), dtype=float)
+
+        I_n = _trapz(v, s_n)                                # ∫v ds(归一化)
+        v_bar = I_n / c_n                                     # 弦平均流速
+
+        c_phys = R * c_n
+        I_phys = vc * R * I_n                                 # [m^2/s]
+        q = None if dz is None else I_phys * dz
+        qw = None if omega is None else omega * v_bar * c_n
+
+        return ChordResult(v_bar=v_bar, chord_length=c_phys, line_integral=I_phys,
+                           flow_per_dz=I_phys, flow=q, omega_contrib=qw,
+                           max_v=float(np.max(v)), d=d, theta_deg=theta_deg)
+
+    def chord_flow_4(self, profile, theta_deg, scheme="Gauss-Jacobi", **kw):
+        """四条声道(±内弦、±外弦)的逐条结果与加权总流量(归一化单位 vc*R^2)。"""
+        res = []
+        for d, w in self.SCHEMES[scheme]:
+            for sign in (1.0, -1.0):
+                res.append(self.chord_flow(profile, sign * d, theta_deg,
+                                           omega=w, **kw))
+        q = sum(r.omega_contrib for r in res)
+        return res, q
+
+    @staticmethod
+    def reference_flow(profile, Nw=801, Nt=720):
+        """截面二重积分得到的精确流量(归一化单位 vc*R^2), 作为误差分析的真值。
+
+        用 r = 1 - w^2 换元: (1-r)^(1/n) 在 r->1 处导数无穷, 均匀网格收敛是
+        O(h^1.1) 量级(2001 点仍差 2e-4); 换元后被积函数为 w^(2/n), 光滑,
+        401 点即可到 1e-5。
+        """
+        w = np.linspace(0.0, 1.0, Nw)
+        t = np.linspace(0.0, 2.0 * pi, Nt)
+        WW, TT = np.meshgrid(w, t, indexing="ij")
+        RR = 1.0 - WW ** 2
+        V = np.asarray(profile(SimpleNamespace(r=RR, theta=TT, alpha=TT)),
+                       dtype=float)
+        integrand = V * RR * (2.0 * WW)          # v * r * |dr/dw|
+        return float(_trapz(_trapz(integrand, t, axis=1), w))
+
+    def error_curve(self, profile, scheme="Gauss-Jacobi", angles=None,
+                    N=161, q_ref=None):
+        """测量误差随旋转角的变化。
+
+        返回 (angles, eps), eps = (Q_meas - Q_ref) / Q_ref * 100  [%]
+
+        angles : 默认 0°~180° 共 91 点, 也可自行传入
+        N      : 每条弦的采样点数(余弦聚集), 161 点误差约 5e-5
+        q_ref  : 可外部传入, 避免同一模型重复计算真值
+        """
+        if angles is None:
+            angles = np.linspace(0.0, 180.0, 91)
+        angles = np.asarray(angles, dtype=float)
+        if q_ref is None:
+            q_ref = self.reference_flow(profile, Nw=401, Nt=360)
+        eps = np.empty(angles.shape, dtype=float)
+        for i, ang in enumerate(angles):
+            _, q = self.chord_flow_4(profile, float(ang), scheme, N=N)
+            eps[i] = (q - q_ref) / q_ref * 100.0
+        return angles, eps
+
     def plot_profile(self,profile, title=None, N=401, n_levels=10, cmap="jet",
                 save=None, ax=None, colorbar=True, contour_lines=True):
         """
@@ -111,7 +222,8 @@ class flow_measure():
         T = np.mod(np.arctan2(Z, X), 2 * np.pi)          # 必须 [0, 2π)
 
         # 2) 组装 self, 调用剖面函数
-        prof = SimpleNamespace(r=R, theta=T, alpha=T)     # alpha 是 theta 的别名, 防止属性名不一致
+        # 圆外置 r=1 (v=0, 反正随后会被掩掉), 避免负底数求分数次幂产生 nan 告警
+        prof = SimpleNamespace(r=np.minimum(R, 1.0), theta=T, alpha=T)
         V = np.asarray(profile(prof), dtype=float)
 
         # 3) 圆外裁掉 + 按自身最大值归一化
@@ -147,4 +259,18 @@ class flow_measure():
         if own:
             plt.show()
         return fig
+
+
+if __name__ == "__main__":
+    fm = flow_measure()
+    for idx in (0, 3):
+        prof = fm.model_list[idx]
+        q_ref = fm.reference_flow(prof)
+        print("A%d: Q_ref = %.6f  (单位 Vc*R^2)" % (idx + 1, q_ref))
+        for scheme in fm.SCHEMES:
+            paths, q = fm.chord_flow_4(prof, 0.0, scheme)
+            err = (q - q_ref) / q_ref * 100.0
+            vbars = "  ".join("%.4f" % r.v_bar for r in paths)
+            print("   %-13s v_bar = [%s]  Q = %.6f  eps = %+.3f%%"
+                  % (scheme, vbars, q, err))
 
